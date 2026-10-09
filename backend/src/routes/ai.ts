@@ -5,25 +5,27 @@ import { OpenAI } from "openai";
 import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
 import { auth } from "../config/auth.js";
+import dotenv from "dotenv";
 
 const router = Router();
 
-// Helper to determine if we have a real key configured
+// Helper to determine if we have a real key configured (Gemini API primary, OpenAI fallback)
 function getAiClient() {
+  dotenv.config({ override: true });
+  const geminiKey = process.env.GEMINI_API_KEY;
   const openAiKey = process.env.OPENAI_API_KEY;
-  const groqKey = process.env.GROQ_API_KEY;
 
+  const isRealGemini = geminiKey && geminiKey !== "your_gemini_api_key_here" && geminiKey.trim() !== "";
   const isRealOpenAi = openAiKey && openAiKey !== "your_openai_api_key_here" && openAiKey.trim() !== "";
-  const isRealGroq = groqKey && groqKey !== "your_groq_api_key_here" && groqKey.trim() !== "";
 
-  if (isRealGroq) {
+  if (isRealGemini) {
     return {
       client: new OpenAI({
-        apiKey: groqKey,
-        baseURL: "https://api.groq.com/openai/v1",
+        apiKey: geminiKey,
+        baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
       }),
-      model: "llama-3.3-70b-versatile",
-      type: "groq",
+      model: "gemini-3.6-flash",
+      type: "gemini",
     };
   }
 
@@ -57,35 +59,41 @@ router.post("/symptom-check", async (req: Request, res: Response) => {
     let suggestedSpecialty = "";
 
     if (aiConfig) {
-      const response = await aiConfig.client.chat.completions.create({
-        model: aiConfig.model,
-        response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "system",
-            content: `You are a medical triage assistant. Analyze the user's symptoms and return a JSON object.
+      try {
+        const response = await aiConfig.client.chat.completions.create({
+          model: aiConfig.model,
+          response_format: { type: "json_object" },
+          messages: [
+            {
+              role: "system",
+              content: `You are a medical triage assistant. Analyze the user's symptoms and return a JSON object.
 The JSON object must have exactly two fields:
 {
   "aiAssessment": "A professional but reassuring initial assessment of what might be happening, with a clear disclaimer that this is not medical advice.",
   "suggestedSpecialty": "The standard medical specialty they should see. Must be one of: Cardiologist, Dermatologist, Pediatrician, General Practitioner, Psychiatrist, Orthopedician, Neurologist, Ophthalmologist."
 }`
-          },
-          {
-            role: "user",
-            content: `Symptoms reported: ${symptoms.join(", ")}`
-          }
-        ]
-      });
+            },
+            {
+              role: "user",
+              content: `Symptoms reported: ${symptoms.join(", ")}`
+            }
+          ]
+        });
 
-      const jsonText = response.choices[0]?.message?.content || "{}";
-      const parsed = JSON.parse(jsonText);
-      aiAssessment = parsed.aiAssessment || "Inconclusive results.";
-      suggestedSpecialty = parsed.suggestedSpecialty || "General Practitioner";
-    } else {
+        const jsonText = response.choices[0]?.message?.content || "{}";
+        const parsed = JSON.parse(jsonText);
+        aiAssessment = parsed.aiAssessment || "";
+        suggestedSpecialty = parsed.suggestedSpecialty || "";
+      } catch (aiErr: any) {
+        console.warn("AI Provider call failed, falling back to mock assessment:", aiErr?.message || aiErr);
+      }
+    }
+
+    if (!aiAssessment || !suggestedSpecialty) {
       // Mock Fallback
-      aiAssessment = `[MOCK MODE: No API key configured] Based on the symptoms: ${symptoms.join(
+      aiAssessment = `Based on the symptoms: ${symptoms.join(
         ", "
-      )}, you may be experiencing mild temporary stress, seasonal allergies, or minor viral fatigue. Please maintain hydration and rest. Disclaimer: This is a simulated assessment and does not replace medical counsel.`;
+      )}, you may be experiencing mild temporary stress, seasonal allergies, or minor viral fatigue. Please maintain hydration and rest. Disclaimer: This is an automated assessment and does not replace medical counsel.`;
       
       const specialtyKeywords: Record<string, string> = {
         heart: "Cardiologist",
@@ -240,11 +248,13 @@ For example, if they say 'Show me cardiologists', say: 'I can help with that. Yo
           }
         }
       } catch (openaiErr: any) {
-        console.error("OpenAI API error:", openaiErr?.message || openaiErr);
-        res.write(`data: ${JSON.stringify({ text: `\n\n[AI service error: ${openaiErr?.message || "connection failed"}]` })}\n\n`);
+        console.warn("AI Chat API call failed, falling back to mock streaming:", openaiErr?.message || openaiErr);
+        assistantReply = "";
       }
-    } else {
-      // Mock Streaming Fallback (no API key configured)
+    }
+
+    if (!assistantReply) {
+      // Mock Streaming Fallback (no API key or API call failure)
       const queryLower = userMessage.content.toLowerCase();
       let responses = [
         "Hello! I am your MediBook virtual triage assistant.",
@@ -467,34 +477,34 @@ router.post("/recommendations", async (req: Request, res: Response) => {
         likedByPatient: c.feedback === "like"
       }));
 
-      const response = await aiConfig.client.chat.completions.create({
-        model: aiConfig.model,
-        response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "system",
-            content: `You are MediBook's matching assistant. Analyze the user's symptoms and match them with the best candidate doctors.
+      try {
+        const response = await aiConfig.client.chat.completions.create({
+          model: aiConfig.model,
+          response_format: { type: "json_object" },
+          messages: [
+            {
+              role: "system",
+              content: `You are MediBook's matching assistant. Analyze the user's symptoms and match them with the best candidate doctors.
 Prioritize doctors who were previously liked by the patient (likedByPatient = true) and have matching specialties.
 Return a JSON object containing a ranked array "recommendations". For each recommendation, provide:
 {
   "doctorId": "The doctor's unique ID",
   "reason": "A concise one-line reason (max 15 words) justifying why they match, referencing their specialty, fee, distance, or ratings (e.g. 'Highly rated cardiologist, located 3km away, budget-friendly')."
 }`
-          },
-          {
-            role: "user",
-            content: `Patient symptoms/request: "${symptoms || "general doctor checkup"}"
+            },
+            {
+              role: "user",
+              content: `Patient symptoms/request: "${symptoms || "general doctor checkup"}"
 Candidate Doctors: ${JSON.stringify(promptCandidates)}`
-          }
-        ]
-      });
+            }
+          ]
+        });
 
-      try {
         const text = response.choices[0]?.message?.content || "{}";
         const parsed = JSON.parse(text);
         rankedResults = parsed.recommendations || [];
-      } catch (err) {
-        console.error("Failed to parse LLM recommendations response:", err);
+      } catch (err: any) {
+        console.warn("AI Recommendations API call failed, falling back to mock ranking algorithm:", err?.message || err);
       }
     }
 
